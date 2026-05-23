@@ -1,0 +1,92 @@
+# TCP Retransmission Smuggling (TRS) Lab
+# Isolated L3 router topology (middle) so we can capture every segment on the wire
+# and apply tc netem for controlled loss/retransmissions.
+
+x-common-caps: &common-caps
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+
+networks:
+  left:   # attacker <-> middle
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+          gateway: 10.10.0.1
+  right:  # middle <-> backend
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
+          gateway: 10.20.0.1
+
+services:
+  # --- Backend: receives the "application" stream and logs exactly what it gets ---
+  backend:
+    build: ./compose/backend
+    container_name: trs-backend
+    networks:
+      right:
+        ipv4_address: 10.20.0.2
+    # No published ports - fully isolated lab network
+    restart: "no"
+    environment:
+      - LOG_LEVEL=DEBUG
+    # The entrypoint will set default route (already via 10.20.0.1 from IPAM)
+    # and start the Python logger.
+
+  # --- Attacker: traffic generator (normal + loss-induced retrans + later raw injection) ---
+  attacker:
+    build: ./compose/attacker
+    container_name: trs-attacker
+    networks:
+      left:
+        ipv4_address: 10.10.0.2
+    <<: *common-caps
+    depends_on:
+      - backend
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./pcaps:/pcaps
+    # Default command overridden in runbook / docker compose run
+    # Example: docker compose run --rm attacker python /app/generator.py --case loss --target 10.20.0.2:8080
+
+  # --- Middle: L3 router + packet capture point (tcpdump sees everything being forwarded) ---
+  middle:
+    build: ./compose/middle
+    container_name: trs-middle
+    networks:
+      left:
+        ipv4_address: 10.10.0.1
+      right:
+        ipv4_address: 10.20.0.1
+    <<: *common-caps
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.forwarding=1
+      - net.ipv4.conf.default.forwarding=1
+    volumes:
+      - ./pcaps:/pcaps
+    # tcpdump runs on both legs inside the container (see entrypoint.sh)
+
+  # --- Zeek (optional live or offline): used for deep TCP reassembly logging ---
+  # Use official zeek image; attach to both networks so it can also reach everything if needed.
+  # For live capture Zeek would need to be inside middle or use a tap; for v1 we feed it pcaps.
+  zeek:
+    image: zeek/zeek:6.0
+    container_name: trs-zeek
+    networks:
+      - left
+      - right
+    profiles: ["zeek"]   # docker compose --profile zeek up
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./pcaps:/pcaps
+      - ./configs/zeek:/zeek-config:ro
+      - ./scripts:/scripts:ro
+    working_dir: /zeek-config
+    # Example usage after capture:
+    # docker compose --profile zeek run --rm zeek zeek -C -r /pcaps/capture-*.pcap local.zeek

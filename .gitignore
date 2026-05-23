@@ -1,0 +1,11 @@
+# TRS Lab ignores
+pcaps/
+*.log
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.swp
+*~
+# Docker build artifacts (optional)
+# .docker/
