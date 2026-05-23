@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The generator and any helper scripts live in /app
 # We also bind-mount ./scripts at runtime for easy iteration
 COPY generator.py /app/generator.py
+COPY raw_tcp.py   /app/raw_tcp.py
 
 ENV PYTHONUNBUFFERED=1
 

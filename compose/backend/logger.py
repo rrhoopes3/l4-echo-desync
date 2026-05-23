@@ -66,10 +66,12 @@ def handle_client(conn: socket.socket, addr: tuple):
         conn.close()
         log(f"CLOSED {peer} - total received: {len(total)} bytes in {chunks} chunks")
         if total:
-            # Final summary - the "application view"
-            log("=== APPLICATION VIEW (exact bytes delivered to app) ===")
+            # Final summary — the "application view".
+            # Peer is embedded in the markers so analyze.py can correlate
+            # even when multiple connections interleave in the log.
+            log(f"=== APPLICATION VIEW peer={peer} (exact bytes delivered to app) ===")
             log(hexdump(bytes(total)))
-            log(f"=== END (len={len(total)}) ===")
+            log(f"=== END peer={peer} len={len(total)} ===")
         else:
             log("No data received on this connection.")
 

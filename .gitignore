@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+.claude/
 *.swp
 *~
 # Docker build artifacts (optional)

@@ -1,69 +1,78 @@
 # TRS Research - Zeek local.zeek
-# Verbose TCP reassembly + retransmission logging for desync detection
+# Verbose TCP reassembly + retransmission logging for desync detection.
 #
 # Usage (offline pcap):
-#   zeek -C -r /pcaps/capture-....pcap /zeek-config/local.zeek
+#   zeek -C -r /pcaps/eth0-XXXX.pcap /zeek-config/local.zeek
 #
-# The goal is to expose exactly what Zeek's TCP reassembly engine saw for each
-# segment / retransmitted segment and compare it to what the backend application received.
+# Goal: expose exactly what Zeek's TCP reassembly engine saw for each segment
+# (incl. retransmits) and compare it to what the backend application received.
 
 @load base/frameworks/notice
 @load base/protocols/conn
 @load base/protocols/http
 @load base/protocols/weird
 
-# === TCP Reassembly tuning for research ===
-redef TCP::reassemble_all_packets = T;          # Do not elide any segments
-redef TCP::max_gaps = 100;                      # Be tolerant but log gaps
-redef TCP::max_old_segments = 100;              # Keep history of older segments
+# === Notice type for retransmit observations ===
+redef enum Notice::Type += {
+    TCP_Retransmission,
+    TCP_Overlap_Different_Content,
+};
 
-# Produce the classic conn.log + http.log + weird.log with maximum detail
-redef Conn::default_extract_max_size = 0;       # no automatic file extraction unless wanted
+# === Reassembly tuning ===
+# Note: there is no "reassemble_all_packets" tunable in Zeek 6.x.
+# The exact names of the per-flow reassembly knobs vary between Zeek
+# versions; for portability we leave them at defaults and observe via events.
+# If you need to retain more out-of-order history, uncomment after verifying
+# the spelling on your Zeek build with `zeek -NN | grep -i reassem`.
+# redef tcp_max_old_segments = 1024;
 
-# Log every TCP contents chunk that the reassembler delivers to the application layer
+# === Reassembled application-layer chunks ===
+# tcp_contents fires per chunk the reassembler delivers up to scriptland.
+# Compare these against the backend's "APPLICATION VIEW" hexdump.
 event tcp_contents(c: connection, is_orig: bool, seq: count, contents: string)
     {
-    # This event fires for reassembled *application* data (after reassembly)
-    # Very useful to see what Zeek believed the stream contained at each point.
-    local dir = is_orig ? "->" : "<-";
-    print fmt("TCP_CONTENTS %s %s seq=%d len=%d | %s",
+    local dir = is_orig ? "C->S" : "S->C";
+    print fmt("TCP_CONTENTS uid=%s %s seq=%d len=%d preview=%s",
               c$uid, dir, seq, |contents|, contents[:120]);
     }
 
-# Log retransmissions explicitly (Zeek raises this when it detects a retransmit)
+# === Retransmits ===
+# Zeek raises tcp_rexmit on detected duplicate-seq segments. Signature is
+# (c, is_orig, seq, len, data_in_flight) on Zeek 5.x/6.x.
 event tcp_rexmit(c: connection, is_orig: bool, seq: count, len: count, data_in_flight: count)
     {
-    local dir = is_orig ? "->" : "<-";
-    print fmt("TCP_REXMIT  %s %s seq=%d len=%d in_flight=%d",
+    local dir = is_orig ? "C->S" : "S->C";
+    print fmt("TCP_REXMIT uid=%s %s seq=%d len=%d in_flight=%d",
               c$uid, dir, seq, len, data_in_flight);
-    NOTICE([$note=Recon::TCP_Retransmission,
-            $msg=fmt("Retransmission observed: %s %s seq=%d", c$uid, dir, seq),
+    NOTICE([$note=TCP_Retransmission,
+            $msg=fmt("Retransmission observed: %s %s seq=%d len=%d",
+                     c$uid, dir, seq, len),
             $conn=c]);
     }
 
-# Also catch "weird" events that often flag reassembly anomalies
-event weird(c: connection, name: string, addl: string, source: string)
+# === Weird events related to reassembly ===
+# Catches: data_after_reset, fragment_with_DF, rexmit_inconsistency,
+#          retransmission_inconsistency, possible_split_routing, etc.
+event conn_weird(name: string, c: connection, addl: string)
     {
-    if ( /reassem|tcp|gap|overlap/ in name )
-        print fmt("WEIRD %s %s %s %s", c$uid, name, addl, source);
+    if ( /rexmit|retrans|reassem|overlap|gap|inconsist/ in name )
+        print fmt("TCP_WEIRD uid=%s name=%s addl=%s", c$uid, name, addl);
     }
 
-# Extra: log the initial SYN/FIN/ACK flags with seq numbers for the flow
+# === Connection lifecycle ===
 event connection_established(c: connection)
     {
-    print fmt("CONN_EST %s orig=%s:%d resp=%s:%d orig_seq=%d resp_seq=%d",
-              c$uid, c$id$orig_h, c$id$orig_p, c$id$resp_h, c$id$resp_p,
-              c$orig$start_seq, c$resp$start_seq);
+    print fmt("CONN_EST uid=%s %s:%d -> %s:%d",
+              c$uid, c$id$orig_h, c$id$orig_p, c$id$resp_h, c$id$resp_p);
     }
 
 event connection_state_remove(c: connection)
     {
-    print fmt("CONN_END  %s duration=%.3fs orig_bytes=%d resp_bytes=%d",
-              c$uid, c$duration, c$orig$size, c$resp$size);
+    local state = c?$conn && c$conn?$conn_state ? c$conn$conn_state : "?";
+    print fmt("CONN_END uid=%s duration=%.3fs orig_bytes=%d resp_bytes=%d state=%s",
+              c$uid, interval_to_double(c$duration),
+              c$orig$size, c$resp$size, state);
     }
 
-# If you want per-segment visibility (very verbose, before full reassembly):
-# event tcp_packet(c: connection, is_orig: bool, flags: string, seq: count, ack: count, len: count, payload: string)
-#     { ... }
-
-print "TRS Zeek configuration loaded - retransmit and reassembly events will be printed.";
+print "TRS Zeek configuration loaded.";
+print "Will print: CONN_EST, TCP_CONTENTS, TCP_REXMIT, TCP_WEIRD, CONN_END";

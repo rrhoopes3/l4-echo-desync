@@ -16,24 +16,24 @@ Everything runs in an isolated bridge topology (no host exposure, no external tr
 ## Quick Start
 
 ```powershell
-# 1. Build the images
+# 1. Build & bring up
 docker compose build
-
-# 2. Bring the lab up
 docker compose up -d
 
-# 3. Run the first interesting experiment (loss → real retransmits)
-docker compose run --rm attacker `
-    python /app/generator.py --case loss --loss 8 --count 3
+# 2. Send the actual TRS overlap primitive (raw-socket, two segments at same seq)
+docker compose run --rm attacker python /app/generator.py --case overlap --count 1
 
-# 4. Watch what the backend actually got
-docker compose logs -f backend
-
-# 5. Analyze the latest pcap with Zeek (retransmit + reassembly events)
-$pcap = (Get-ChildItem pcaps\*.pcap | Sort LastWriteTime -Descending | Select -First 1).Name
+# 3. Run Zeek on the right-leg pcap
+$pcap = (Get-ChildItem pcaps\right-*.pcap | Sort LastWriteTime -Descending | Select -First 1).Name
 docker compose --profile zeek run --rm zeek `
-    zeek -C -r /pcaps/$pcap /zeek-config/local.zeek
+    zeek -C -r /pcaps/$pcap /zeek-config/local.zeek > zeek-run.txt 2>&1
+
+# 4. Capture backend log and diff
+docker compose logs --no-color backend > backend.log
+python scripts\analyze.py --zeek zeek-run.txt --backend backend.log
 ```
+
+Exit code from `analyze.py`: `0` no desync, `2` desync detected, `1` parse error.
 
 Full instructions, architecture, and the exact commands for baseline vs. loss-induced retransmission are in:
 
@@ -46,32 +46,52 @@ Full instructions, architecture, and the exact commands for baseline vs. loss-in
 ```
 docker-compose.yml          # 4-service isolated L3 topology (attacker, middle, backend, zeek)
 compose/
-  attacker/                 # generator.py + Dockerfile (raw + tc + iptables ready)
-  backend/                  # pure-TCP logger that prints every byte the app receives
-  middle/                   # Alpine L3 router + always-on tcpdump capture
-  zeek/                     # (future) custom Zeek build if needed
+  attacker/
+    generator.py            # Test-case runner (baseline, loss, overlap, spurious, partial)
+    raw_tcp.py              # Stdlib userland TCP/IPv4 client over raw sockets
+    Dockerfile
+  backend/
+    logger.py               # Pure-TCP server; hexdumps every byte the app receives
+    Dockerfile
+  middle/
+    entrypoint.sh           # L3 router + per-leg rolling pcap + impair-{left,right} helpers
+    Dockerfile
 configs/
-  zeek/local.zeek           # Maximum-verbosity TCP reassembly + retransmit logging
-pcaps/                      # Live capture files written by the middle (bind-mounted)
+  zeek/local.zeek           # TCP reassembly + retransmit + weird event logging
+pcaps/                      # left-*.pcap and right-*.pcap (rotating, bind-mounted)
 docs/
-  runbook.md                # The lab manual
-plan.txt                    # Original detailed research prompt (scope, phases, success criteria)
-scripts/                    # (future) analysis helpers, result parsers
+  runbook.md                # Step-by-step lab manual
+scripts/
+  analyze.py                # Parses Zeek output + backend log; flags desync per connection
+plan.txt                    # Original research brief (scope, phases, success criteria)
 ```
 
 ---
 
-## Current Status (Phase 1 — MVP)
+## Current Status
 
-- ✅ Isolated routed topology with deterministic subnets
-- ✅ Backend that logs the exact application-layer bytes
-- ✅ Generator supporting baseline + loss-induced real retransmissions (kernel TCP)
-- ✅ Always-on full-packet capture at the "inspection point"
-- ✅ Zeek config that prints `TCP_REXMIT`, `TCP_CONTENTS`, conn lifecycle
-- ✅ Runbook with reproducible commands for the first two test cases
-- ⏳ Raw-socket hijack mode for *different-payload* overlapping retransmits (next)
-- ⏳ Automated desync detector (Zeek logs vs. backend logs)
-- ⏳ Suricata + ModSecurity variants
+**Phase 1 (lab infrastructure)** — complete
+- Isolated routed topology with deterministic subnets
+- Backend logs exact application-layer bytes (hexdump per connection)
+- Per-leg rotating pcap captures (Ethernet frames, replayable into other IDSes)
+- Live impairment helpers on the middle: `impair-right loss|drop|delay|clear`
+  (deterministic-drop mode for reproducibility, not just random `netem`)
+- Zeek config that prints `TCP_REXMIT`, `TCP_CONTENTS`, `TCP_WEIRD`, conn lifecycle
+
+**Phase 2 (TRS primitives)** — implemented, awaiting validation
+- Stdlib userland TCP client (`raw_tcp.py`) with full handshake/data/FIN
+- `--case overlap` — two segments at same seq with different content
+- `--case spurious` — duplicate post-ACK retransmits
+- `--case partial` — Ptacek/Newsham-style partial-overlap shape
+- Automated `analyze.py` that diffs Zeek's reassembled view vs the backend's
+  delivered bytes per connection and emits a desync verdict
+
+**Phase 3 (extensions)** — pending
+- Suricata + ModSecurity service variants
+- Live Zeek (network-namespace sidecar on middle) instead of offline pcap
+- Encoding-confusion overlap cases (UTF-8 vs Windows-1252 best-fit)
+- Byte-exact reassembly diff using Python pcap parsing (currently we diff
+  Zeek's text-event previews against backend hexdumps)
 
 See `plan.txt` for the full research questions, threat model, and deliverable list.
 
@@ -113,6 +133,11 @@ Start by reading `plan.txt` and `docs/runbook.md`, then open an issue or PR.
 
 ---
 
-**Status**: Early but functional. The lab can already demonstrate real retransmitted TCP segments and log them differently from the application view.
+**Status**: The lab now generates the actual TRS primitives (overlap, spurious,
+partial) via a stdlib raw-socket TCP client and ships an automated desync
+detector. The raw-socket path has been implemented but not yet end-to-end
+validated in a fully bootstrapped container — first runs may surface kernel
+quirks (TX checksum offload, bridge filter rules) that need iterating on.
+See `docs/runbook.md` §11 for troubleshooting.
 
 Happy researching!
