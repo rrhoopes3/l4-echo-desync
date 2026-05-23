@@ -234,7 +234,8 @@ class RawTcpSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
-            r, _, _ = select.select([self.recv_sock], [], [], remaining)
+            poll_to = max(0.0, remaining)
+            r, _, _ = select.select([self.recv_sock], [], [], poll_to)
             if not r:
                 return None
             try:
@@ -260,16 +261,20 @@ class RawTcpSession:
         if not self._rst_installed:
             self.install_rst_suppression()
 
-        # SYN
-        self._send(flags=SYN, ack=0)
-        synack = self._recv_match(SYN | ACK | RST, SYN | ACK, timeout=timeout)
-        if synack is None:
-            raise TimeoutError(f"no SYN-ACK from {self.dst_ip}:{self.dst_port}")
-
-        self.rcv_next = (synack.seq + 1) & 0xFFFFFFFF
-        self.snd_seq = (self.snd_seq + 1) & 0xFFFFFFFF   # SYN consumes 1
-        self._send(flags=ACK)
-        self._opened = True
+        # SYN with basic retry for transient raw path flakiness (e.g. timing on bridge)
+        last_err = None
+        for attempt in range(3):
+            self._send(flags=SYN, ack=0)
+            synack = self._recv_match(SYN | ACK | RST, SYN | ACK, timeout=timeout)
+            if synack is not None:
+                self.rcv_next = (synack.seq + 1) & 0xFFFFFFFF
+                self.snd_seq = (self.snd_seq + 1) & 0xFFFFFFFF   # SYN consumes 1
+                self._send(flags=ACK)
+                self._opened = True
+                return
+            last_err = f"no SYN-ACK (attempt {attempt+1})"
+            time.sleep(0.05 * (attempt + 1))
+        raise TimeoutError(f"no SYN-ACK from {self.dst_ip}:{self.dst_port} after retries: {last_err}")
 
     def send_data(self, payload: bytes, push: bool = True) -> int:
         """Normal data segment; advances snd_seq. Returns seq used."""
@@ -305,7 +310,11 @@ class RawTcpSession:
         """Read and discard any pending peer data for `duration` seconds."""
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
-            r, _, _ = select.select([self.recv_sock], [], [], deadline - time.monotonic())
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            poll_to = max(0.0, remaining)
+            r, _, _ = select.select([self.recv_sock], [], [], poll_to)
             if not r:
                 return
             try:

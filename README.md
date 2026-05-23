@@ -20,20 +20,25 @@ Everything runs in an isolated bridge topology (no host exposure, no external tr
 docker compose build
 docker compose up -d
 
-# 2. Send the actual TRS overlap primitive (raw-socket, two segments at same seq)
-docker compose run --rm attacker python /app/generator.py --case overlap --count 1
+# 2. (Phase 2) One-command overlap desync repro (recommended)
+python scripts/run_experiment.py --case overlap --count 3
 
-# 3. Run Zeek on the right-leg pcap
+# Or the manual primitives + analysis (still supported):
+docker compose run --rm attacker python /app/generator.py --case overlap --count 1
+# ... then Zeek + analyze as before (see docs/runbook.md)
+
+# 3. (manual) Run Zeek on the right-leg pcap
 $pcap = (Get-ChildItem pcaps\right-*.pcap | Sort LastWriteTime -Descending | Select -First 1).Name
 docker compose --profile zeek run --rm zeek `
     zeek -C -r /pcaps/$pcap /zeek-config/local.zeek > zeek-run.txt 2>&1
 
-# 4. Capture backend log and diff
+# 4. (manual) Capture backend log and diff
 docker compose logs --no-color backend > backend.log
 python scripts\analyze.py --zeek zeek-run.txt --backend backend.log
 ```
 
-Exit code from `analyze.py`: `0` no desync, `2` desync detected, `1` parse error.
+The `run_experiment.py` wrapper selects the pcap, runs Zeek+analyzer and saves `report-*.txt` + `experiment-*.json` metadata under `pcaps/`.
+Exit code from `analyze.py` / runner: `0` no desync, `2` desync detected, `1` parse error.
 
 Full instructions, architecture, and the exact commands for baseline vs. loss-induced retransmission are in:
 
@@ -78,13 +83,12 @@ plan.txt                    # Original research brief (scope, phases, success cr
   (deterministic-drop mode for reproducibility, not just random `netem`)
 - Zeek config that prints `TCP_REXMIT`, `TCP_CONTENTS`, `TCP_WEIRD`, conn lifecycle
 
-**Phase 2 (TRS primitives)** — implemented, awaiting validation
-- Stdlib userland TCP client (`raw_tcp.py`) with full handshake/data/FIN
-- `--case overlap` — two segments at same seq with different content
-- `--case spurious` — duplicate post-ACK retransmits
-- `--case partial` — Ptacek/Newsham-style partial-overlap shape
-- Automated `analyze.py` that diffs Zeek's reassembled view vs the backend's
-  delivered bytes per connection and emits a desync verdict
+**Phase 2 (TRS primitives)** — complete and usable
+- Stdlib userland TCP client (`raw_tcp.py`) with hardened open/inject/drain/close + retry
+- `--case overlap` / `partial` / `spurious` — controlled different-payload retransmits
+- `scripts/run_experiment.py --case overlap --count 3` — full pipeline (gen, pcap, Zeek, analyze) producing hex-diff desync reports
+- Enhanced analyzer with concrete "Zeek saw X vs backend Y" + first-diff hex evidence
+- `analyze.py` now reliably surfaces measurable reassembly desync for overlap/partial cases
 
 **Phase 3 (extensions)** — pending
 - Suricata + ModSecurity service variants

@@ -52,13 +52,13 @@ def handle_client(conn: socket.socket, addr: tuple):
             chunks += 1
             total.extend(chunk)
             log(f"RECV {len(chunk)} bytes (chunk #{chunks}) from {peer}")
-            # Log the exact bytes in multiple formats for analysis
-            log(f"  repr: {chunk!r}")
+            # Log the exact bytes in multiple formats for analysis (peer always present)
+            log(f"  [{peer}] repr: {chunk!r}")
             if len(chunk) <= 256:
-                log("  hexdump:\n" + hexdump(chunk))
+                log(f"  [{peer}] hexdump:\n" + hexdump(chunk))
             else:
-                log("  hexdump (first 256):\n" + hexdump(chunk[:256]))
-                log(f"  ... ({len(chunk)-256} more bytes)")
+                log(f"  [{peer}] hexdump (first 256):\n" + hexdump(chunk[:256]))
+                log(f"  [{peer}] ... ({len(chunk)-256} more bytes)")
 
     except Exception as exc:
         log(f"ERROR on {peer}: {exc}")
