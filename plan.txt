@@ -1,0 +1,120 @@
+PROMPT START
+You are a senior protocol security researcher and white-hat penetration tester specializing in L3/L4 evasion techniques and stateful inspection bypasses. Your task is to design, implement, and document a lab-only proof-of-concept for a novel evasion class called:
+TCP Retransmission Smuggling (TRS) — also referred to as L4 Echo Desync.
+Strict Ethical & Scope Rules (non-negotiable)
+
+This is 100% authorized defensive research only.
+Everything must run in an isolated lab environment (Docker Compose, local VMs, or air-gapped test network). No production systems, no external targets, no scanning of systems you do not own.
+If you discover a real, previously unknown vulnerability in any open-source tool during research, you must document it responsibly and suggest a path for coordinated disclosure.
+Goal is improving defenses, not creating offensive tooling.
+
+Refined Attack Model (use this exact definition)
+TCP Retransmission Smuggling exploits inconsistencies in how stateful network inspectors (WAFs, IDS/IPS) handle TCP retransmissions during stream reassembly, compared to the actual backend application.
+Core primitive:
+
+Attacker sends a TCP segment containing a payload.
+The inspector processes the initial transmission (normalizes, applies rules, deduplicates, etc.).
+Due to natural or induced packet loss, TCP retransmits the segment.
+The inspector’s reassembly engine treats the retransmitted segment asymmetrically (skips re-inspection, applies different normalization, fails to deduplicate correctly, or has a different view of “already seen” bytes).
+The backend receives the full stream and interprets the payload differently — enabling filter bypass, injection, or evasion that would have been blocked on the first pass.
+
+Key insight: TCP retransmission is normally invisible above L4. Any asymmetry in how an inspector handles the retransmit event creates a desync with the endpoint — a TCP-layer analog to HTTP Request Smuggling.
+Target surface (priority order):
+
+Open-source IDS/IPS stream reassemblers (Zeek, Suricata, Snort)
+WAF stream handling (ModSecurity, custom proxies)
+Any system that performs TCP reassembly + content inspection
+
+Not in scope for this research:
+
+Pure endpoint charset flipping (unrealistic — apps don’t see retransmit flags)
+Off-path forced retransmission (too unreliable)
+Production exploitation
+
+Research Questions to Answer
+
+Do Zeek or Suricata exhibit asymmetric behavior between original and retransmitted TCP segments during reassembly?
+Can we construct a payload + retransmit pattern that causes an inspector to either:
+Skip inspection on the retransmit, or
+Normalize the data differently than the backend?
+
+Under what conditions (natural loss, spurious retransmit, overlap, specific sequence numbers) does desync occur?
+What is the practical impact on common filter types (string matching, regex, encoding normalization, etc.)?
+How can defenders detect or mitigate this class of evasion?
+
+Implementation Requirements
+Phase 1: Lab Environment (Docker Compose recommended)
+
+One container: Traffic generator / attacker (Python)
+One container: Inspector under test (Zeek or Suricata — start with Zeek because its reassembler is well-documented)
+One container: Simple backend (nginx or a minimal Python TCP/HTTP server that logs everything it receives)
+Isolated bridge network
+Wireshark / tcpdump on a monitoring interface for full packet capture
+
+Phase 2: Traffic Generator
+
+Use Python socket + raw TCP (no Scapy required — keep dependencies minimal).
+Ability to:
+Send a crafted TCP segment with a chosen payload.
+Simulate or force a retransmission (use tc netem on the interface for controlled loss, or manually craft a duplicate segment with the same sequence number after a delay).
+Optionally send overlapping segments or spurious retransmits.
+
+Payload ideas to test (layered for maximum effect):
+Text that passes common WAF rules in UTF-8 but would be malicious under Windows-1252 / ISO-8859-1 best-fit mapping.
+Encoded payloads (base64, URL, double-encoded) that trigger different normalization on retransmit.
+Simple command-injection strings that a regex might miss on second pass.
+
+
+Phase 3: Observation & Measurement
+
+Capture full pcaps on both sides of the inspector.
+Compare:
+What the inspector logged / alerted on (original vs retransmit path)
+What the backend actually received and processed
+
+Log TCP sequence numbers, ACKs, and any retransmission flags visible in Zeek/Suricata logs.
+Automate comparison (Python script that parses Zeek logs + backend logs and flags desync events).
+
+Phase 4: Test Cases (minimum viable)
+
+Baseline: Normal delivery, no loss → everything inspected.
+Natural loss simulation (5–10% random loss via tc).
+Targeted retransmit of a single malicious segment.
+Spurious retransmission (duplicate segment that was already ACKed).
+Overlapping retransmit (second segment overlaps previous data with different content — classic evasion vector).
+Charset/encoding confusion layered on top of retransmit.
+
+Phase 5: Output Deliverables
+You must produce:
+
+Complete Docker Compose setup + all configuration files.
+Python traffic generator script (well-commented, modular).
+Automated analysis script that detects desync.
+Step-by-step lab runbook (how to reproduce every test case).
+Findings report template (include: conditions for desync, severity, affected versions if discovered, recommended mitigations).
+Mitigation recommendations for Zeek/Suricata/WAF vendors (e.g., always re-inspect retransmits, stronger deduplication, expose retransmit events to scripts).
+
+Technical Constraints & Recommendations
+
+Use Python 3.11+ standard library + socket, struct, subprocess (for tc commands). Avoid heavy dependencies.
+For loss/retransmit control: Use Linux tc qdisc add dev eth0 root netem loss 5% or similar.
+Zeek/Suricata should be run with maximum verbosity and custom scripts that log every reassembled chunk + retransmit events.
+Keep everything reproducible — use fixed seeds, timestamps, and deterministic loss patterns where possible.
+Document every assumption and every edge case you hit.
+
+Success Criteria
+
+You have a working, reproducible lab that can demonstrate at least one clear case of retransmission-induced desync in Zeek or Suricata.
+You have quantified under which conditions the desync occurs.
+You have concrete, actionable recommendations for defenders.
+The entire setup is self-contained and can be run by another researcher with a single docker compose up.
+
+Start by producing:
+
+The full docker-compose.yml and supporting config files.
+The Python traffic generator script.
+The runbook for the first successful test case.
+
+Then iterate based on what you observe.
+This is high-signal defensive research. Be rigorous, be precise, and prioritize clarity so other white-hat researchers can reproduce and extend your work.
+PROMPT END
