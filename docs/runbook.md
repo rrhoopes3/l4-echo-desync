@@ -123,6 +123,39 @@ finalize the first one before the overlap arrives):
 docker compose run --rm attacker python /app/generator.py --case overlap --overlap-delay 0.05
 ```
 
+### 4b. Reproducing a different-payload overlap desync (verified Phase 2 flow)
+
+After `docker compose up -d`, use the experiment runner for the full pipeline
+(capture selection, Zeek reassembly, backend log, analyzer with hex diff):
+
+```powershell
+python scripts/run_experiment.py --case overlap --count 3
+```
+
+The runner:
+- Executes the raw-socket overlap primitive (benign then evil at identical seq)
+- Picks the freshest `right-*.pcap` written by the middle during the run
+- Runs Zeek offline + the analyzer
+- Prints + saves a report containing `DESYNC` + hex samples of "Zeek reassembled (hex)" vs "Backend received (hex)" + first-diff offset when the reassembly policies disagree.
+
+Expected (at least one of the N runs typically shows):
+```
+[DESYNC] 10.10.0.2:54321   (zeek_uid=...)
+    zeek C->S bytes:    118
+    backend bytes:      118
+    ...
+    REASON: content diverges at offset 21: Zeek reassembled != backend received
+    Zeek reassembled (hex): 47 45 54 20 2f 61 70 69 2f 76 31 2f 75 73 65 72 3f 69 64 3d 31 27 ...
+    Backend received  (hex): 47 45 54 20 2f 61 70 69 2f 76 31 2f 75 73 65 72 3f 69 64 3d 31 20 ...
+    First diff byte offset: 21
+```
+
+Report + pcap + logs + `experiment-*.json` metadata are written under `./pcaps/`.
+
+Tweak `--overlap-delay 0.01` or `--count 5` if the first run is clean (timing-dependent which segment "wins" the reassembly).
+
+Same runner works for `--case partial`.
+
 ---
 
 ## 5. Case: spurious retransmit

@@ -32,8 +32,10 @@ redef enum Notice::Type += {
 event tcp_contents(c: connection, is_orig: bool, seq: count, contents: string)
     {
     local dir = is_orig ? "C->S" : "S->C";
+    # For Phase 2 desync research, emit enough of the reassembled bytes for exact
+    # comparison in analyze.py (payloads in lab are <<256 bytes).
     print fmt("TCP_CONTENTS uid=%s %s seq=%d len=%d preview=%s",
-              c$uid, dir, seq, |contents|, contents[:120]);
+              c$uid, dir, seq, |contents|, contents[:256]);
     }
 
 # === Retransmits ===

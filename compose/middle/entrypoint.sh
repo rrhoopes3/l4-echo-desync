@@ -135,11 +135,11 @@ chmod +x /usr/local/bin/impair-left /usr/local/bin/impair-right
 # === Per-leg rolling capture (Ethernet frames, no SLL) ===
 # -G 300 = rotate every 5 min, -W 12 = keep 12 files per leg (1h ring)
 # -s 0   = full packets, -nn = no name resolution
-TS=$(date +%Y%m%d-%H%M%S)
 echo "Starting per-leg captures..."
-tcpdump -i "$LEFT_IF"  -s 0 -nn -G 300 -W 12 -w "/pcaps/left-${TS}-%Y%m%d-%H%M%S.pcap"  >/tmp/tcpdump-left.log  2>&1 &
+# Clean per-leg names (strftime expanded on rotate). Files: right-20260522-213000.pcap etc.
+tcpdump -i "$LEFT_IF"  -s 0 -nn -G 300 -W 12 -w "/pcaps/left-%Y%m%d-%H%M%S.pcap"  >/tmp/tcpdump-left.log  2>&1 &
 LEFT_PID=$!
-tcpdump -i "$RIGHT_IF" -s 0 -nn -G 300 -W 12 -w "/pcaps/right-${TS}-%Y%m%d-%H%M%S.pcap" >/tmp/tcpdump-right.log 2>&1 &
+tcpdump -i "$RIGHT_IF" -s 0 -nn -G 300 -W 12 -w "/pcaps/right-%Y%m%d-%H%M%S.pcap" >/tmp/tcpdump-right.log 2>&1 &
 RIGHT_PID=$!
 
 echo "tcpdump PIDs: left=$LEFT_PID right=$RIGHT_PID"

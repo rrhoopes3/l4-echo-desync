@@ -12,11 +12,14 @@ Correlates Zeek connections with backend connections by orig_port (the
 attacker's ephemeral port, which Zeek prints in CONN_EST and the backend
 logs in NEW CONNECTION from <ip>:<port>).
 
+For Phase 2 (overlap/partial): now emits clear "content diverges" verdict with
+hex samples of Zeek-reassembled vs backend-received bytes and first-diff offset.
+
 Emits one record per matched connection:
-  - bytes Zeek's reassembler delivered (C->S direction)
+  - bytes Zeek's reassembler delivered (C->S direction, from tcp_contents)
   - bytes the backend application received
   - retransmit count, weird events
-  - desync verdict: bytes differ in length or content preview
+  - desync verdict + hex evidence when Zeek view != backend bytes
 
 Usage:
     # 1. Run Zeek on the latest right-leg pcap, saving its prints
@@ -236,6 +239,9 @@ class Verdict:
     rexmit_count: int
     weird_count: int
     desync_reason: list[str] = field(default_factory=list)
+    zeek_sample: Optional[bytes] = None
+    backend_sample: Optional[bytes] = None
+    diff_offset: Optional[int] = None
 
     @property
     def desync(self) -> bool:
@@ -267,14 +273,23 @@ def correlate(
                 v.desync_reason.append(
                     f"byte-count mismatch: zeek_c2s={zc.c2s_total_len} backend={bc.total_bytes}"
                 )
-            # Preview-based content check (Zeek preview is first 120 chars per chunk)
-            preview = zc.c2s_preview_concat.encode("latin-1", errors="replace")
-            backend_head = bc.app_view_hex[: len(preview)]
-            if preview and backend_head and not bc.app_view_hex.startswith(_loose_strip(preview)):
-                # Loose check: Zeek's preview may have escape sequences for non-printable
-                # bytes; compare as best-effort.
-                if not _bytes_compatible(preview, backend_head):
-                    v.desync_reason.append("content preview diverges from backend bytes")
+            # Content check for Phase 2 overlap/partial: compare Zeek delivered bytes vs backend
+            # (preview concat from tcp_contents gives the reassembled C->S bytes Zeek delivered
+            # to scriptland / upper layers; for lab payloads <256B this is the full stream)
+            # Use unescaper so binary bytes (\xff in partial evil, etc.) round-trip correctly from Zeek's print fmt
+            preview = _unescape_zeek_preview(zc.c2s_preview_concat)
+            backend_head = bc.app_view_hex[: max(len(preview), 64)]
+            v.zeek_sample = preview
+            v.backend_sample = bc.app_view_hex[: max(len(preview), 64)]
+            # Direct prefix compare (after loose for Zeek escapes) + best-effort for safety
+            if preview and backend_head:
+                stripped = _loose_strip(preview)
+                if not bc.app_view_hex.startswith(stripped) and not _bytes_compatible(preview, backend_head):
+                    off = _first_diff_offset(preview, bc.app_view_hex)
+                    v.diff_offset = off
+                    v.desync_reason.append(
+                        f"content diverges at offset {off}: Zeek reassembled != backend received"
+                    )
 
         if zc.weirds:
             names = ",".join(sorted({w[0] for w in zc.weirds}))
@@ -317,6 +332,37 @@ def _bytes_compatible(zeek_preview: bytes, backend_head: bytes) -> bool:
     return True
 
 
+def _first_diff_offset(a: bytes, b: bytes) -> int:
+    """Return byte offset of first difference, or -1 if identical up to min len."""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n if len(a) != len(b) else -1
+
+
+def _short_hex(b: bytes, max_len: int = 32) -> str:
+    """Compact hexdump prefix for evidence in reports."""
+    if not b:
+        return "(empty)"
+    h = " ".join(f"{x:02x}" for x in b[:max_len])
+    if len(b) > max_len:
+        h += " ..."
+    return h
+
+
+def _unescape_zeek_preview(s: str) -> bytes:
+    """Recover actual bytes from Zeek print fmt output (handles \\xHH escapes for binary/partial cases)."""
+    if not s:
+        return b""
+    # Replace \xHH with the byte; handle common escapes first
+    def hex_repl(m):
+        return chr(int(m.group(1), 16))
+    s = re.sub(r'\\x([0-9a-fA-F]{2})', hex_repl, s)
+    s = s.replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t').replace('\\\\', '\\').replace('\\0', '\0')
+    return s.encode('latin-1', errors='replace')
+
+
 # === Reporting ===
 
 def render(verdicts: list[Verdict]) -> tuple[str, int]:
@@ -338,6 +384,12 @@ def render(verdicts: list[Verdict]) -> tuple[str, int]:
             desync_count += 1
             for reason in v.desync_reason:
                 lines.append(f"    REASON: {reason}")
+            # For Phase 2 overlap/partial: show concrete hex evidence of the desync
+            if v.zeek_sample is not None and v.backend_sample is not None:
+                lines.append(f"    Zeek reassembled (hex): {_short_hex(v.zeek_sample)}")
+                lines.append(f"    Backend received  (hex): {_short_hex(v.backend_sample)}")
+                if v.diff_offset is not None and v.diff_offset >= 0:
+                    lines.append(f"    First diff byte offset: {v.diff_offset}")
 
     lines.append("")
     lines.append("-" * 78)
